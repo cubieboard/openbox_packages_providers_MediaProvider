@@ -102,6 +102,9 @@ public class MediaProvider extends ContentProvider {
     private static final HashMap<String, String> sArtistAlbumsMap = new HashMap<String, String>();
     private static final HashMap<String, String> sFolderArtMap = new HashMap<String, String>();
 
+    // In memory cache of path<->id mappings, to speed up inserts during media scan
+    HashMap<String, Long> mDirectoryCache = new HashMap<String, Long>();
+
     // A HashSet of paths that are pending creation of album art thumbnails.
     private HashSet mPendingThumbs = new HashSet();
 
@@ -171,6 +174,10 @@ public class MediaProvider extends ContentProvider {
             FileColumns.MEDIA_TYPE,
     };
 
+    private static final String[] sIdOnlyColumn = new String[] {
+        FileColumns._ID
+    };
+
     private Uri mAlbumArtBaseUri = Uri.parse("content://media/external/audio/albumart");
 
     private BroadcastReceiver mUnmountReceiver = new BroadcastReceiver() {
@@ -181,6 +188,7 @@ public class MediaProvider extends ContentProvider {
                         StorageVolume.EXTRA_STORAGE_VOLUME);
                 // If primary external storage is ejected, then remove the external volume
                 // notify all cursors backed by data on that volume.
+                Log.d(TAG, "ejected volume is = " + storage.getPath());
                 if (storage.getPath().equals(mExternalStoragePaths[0])) {
                     detachVolume(Uri.parse("content://media/external"));
                     sFolderArtMap.clear();
@@ -212,6 +220,7 @@ public class MediaProvider extends ContentProvider {
                                 db.update("files", values, where, whereArgs);
                                 // now delete the records
                                 db.delete("files", where, whereArgs);
+								Log.d(TAG, "delete rows from database where = " +where+ " whereArgs = " + whereArgs);
                                 // notify on media Uris as well as the files Uri
                                 context.getContentResolver().notifyChange(
                                         Audio.Media.getContentUri(EXTERNAL_VOLUME), null);
@@ -241,6 +250,12 @@ public class MediaProvider extends ContentProvider {
     private final SQLiteDatabase.CustomFunction mObjectRemovedCallback =
                 new SQLiteDatabase.CustomFunction() {
         public void callback(String[] args) {
+            // We could remove only the deleted entry from the cache, but that
+            // requires the path, which we don't have here, so instead we just
+            // clear the entire cache.
+            // TODO: include the path in the callback and only remove the affected
+            // entry from the cache
+            mDirectoryCache.clear();
             // do nothing if the operation originated from MTP
             if (mDisableMtpObjectCallbacks) return;
 
@@ -518,7 +533,9 @@ public class MediaProvider extends ContentProvider {
                         try {
                             File origFile = new File(mCurrentThumbRequest.mPath);
                             if (origFile.exists() && origFile.length() > 0) {
+                                Log.d(TAG, "start questing thumb of file" + origFile.toString());
                                 mCurrentThumbRequest.execute();
+                                Log.d(TAG, "end questing thumb");
                             } else {
                                 // original file hasn't been stored yet
                                 synchronized (mMediaThumbQueue) {
@@ -1735,6 +1752,7 @@ public class MediaProvider extends ContentProvider {
      * @return
      */
     private boolean waitForThumbnailReady(Uri origUri) {
+    	Log.d(TAG, "waitForThumbnailReady() : uri = " + origUri);
         Cursor c = this.query(origUri, new String[] { ImageColumns._ID, ImageColumns.DATA,
                 ImageColumns.MINI_THUMB_MAGIC}, null, null, null);
         if (c == null) return false;
@@ -1781,6 +1799,7 @@ public class MediaProvider extends ContentProvider {
 
     private boolean queryThumbnail(SQLiteQueryBuilder qb, Uri uri, String table,
             String column, boolean hasThumbnailId) {
+        Log.d(TAG, "queryThumbnail() : uri = " + uri);
         qb.setTables(table);
         if (hasThumbnailId) {
             // For uri dispatched to this method, the 4th path segment is always
@@ -1938,6 +1957,7 @@ public class MediaProvider extends ContentProvider {
             case IMAGES_THUMBNAILS_ID:
                 hasThumbnailId = true;
             case IMAGES_THUMBNAILS:
+				Log.d(TAG, "query():IMAGES_THUMBNAILS");
                 if (!queryThumbnail(qb, uri, "thumbnails", "image_id", hasThumbnailId)) {
                     return null;
                 }
@@ -2120,6 +2140,7 @@ public class MediaProvider extends ContentProvider {
             case VIDEO_THUMBNAILS_ID:
                 hasThumbnailId = true;
             case VIDEO_THUMBNAILS:
+				Log.d(TAG, "query():VIDEO_THUMBNAILS");
                 if (!queryThumbnail(qb, uri, "videothumbnails", "video_id", hasThumbnailId)) {
                     return null;
                 }
@@ -2532,22 +2553,35 @@ public class MediaProvider extends ContentProvider {
                     return 0;
                 }
             }
+            Long cid = mDirectoryCache.get(parentPath);
+            if (cid != null) {
+                if (LOCAL_LOGV) Log.v(TAG, "Returning cached entry for " + parentPath);
+                return cid;
+            }
+
             // Use "LIKE" instead of "=" on case insensitive file systems so we do a
             // case insensitive match when looking for parent directory.
+            // TODO: investigate whether a "nocase" constraint on the column and
+            // using "=" would give the same result faster.
             String selection = (mCaseInsensitivePaths ? MediaStore.MediaColumns.DATA + " LIKE ?"
                     // search only directories.
                     + "AND format=" + MtpConstants.FORMAT_ASSOCIATION
                     : MediaStore.MediaColumns.DATA + "=?");
             String [] selargs = { parentPath };
-            Cursor c = db.query("files", null, selection, selargs, null, null, null);
+            Cursor c = db.query("files", sIdOnlyColumn, selection, selargs, null, null, null);
             try {
+                long id;
                 if (c == null || c.getCount() == 0) {
                     // parent isn't in the database - so add it
-                    return insertDirectory(db, parentPath);
+                    id = insertDirectory(db, parentPath);
+                    if (LOCAL_LOGV) Log.v(TAG, "Inserted " + parentPath);
                 } else {
                     c.moveToFirst();
-                    return c.getLong(0);
+                    id = c.getLong(0);
+                    if (LOCAL_LOGV) Log.v(TAG, "Queried " + parentPath);
                 }
+                mDirectoryCache.put(parentPath, id);
+                return id;
             } finally {
                 if (c != null) c.close();
             }
@@ -3167,6 +3201,7 @@ public class MediaProvider extends ContentProvider {
 
     private MediaThumbRequest requestMediaThumbnail(String path, Uri uri, int priority, long magic) {
         synchronized (mMediaThumbQueue) {
+			Log.d(TAG, "requestMediaThumbnail() : path = " + path);
             MediaThumbRequest req = null;
             try {
                 req = new MediaThumbRequest(
@@ -3192,7 +3227,9 @@ public class MediaProvider extends ContentProvider {
 //            return Environment.getDataDirectory()
 //                + "/" + directoryName + "/" + name + preferredExtension;
         } else {
-            return mExternalStoragePaths[0] + "/" + directoryName + "/" + name + preferredExtension;
+            String s = mExternalStoragePaths[0] + "/" + directoryName + "/" + name + preferredExtension;
+			Log.d(TAG, "generateFileName(): path = " + s);
+			return s;
         }
     }
 
@@ -3462,6 +3499,7 @@ public class MediaProvider extends ContentProvider {
                     && initialValues != null && initialValues.size() == 1) {
                 String oldPath = null;
                 String newPath = initialValues.getAsString(MediaStore.MediaColumns.DATA);
+                mDirectoryCache.remove(newPath);
                 // MtpDatabase will rename the directory first, so we test the new file name
                 if (newPath != null && (new File(newPath)).isDirectory()) {
                     Cursor cursor = db.query(sGetTableAndWhereParam.table, PATH_PROJECTION,
@@ -3474,6 +3512,7 @@ public class MediaProvider extends ContentProvider {
                         if (cursor != null) cursor.close();
                     }
                     if (oldPath != null) {
+                        mDirectoryCache.remove(oldPath);
                         // first rename the row for the directory
                         count = db.update(sGetTableAndWhereParam.table, initialValues,
                                 sGetTableAndWhereParam.where, whereArgs);
